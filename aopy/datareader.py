@@ -12,6 +12,7 @@ import pickle as pkl
 import os
 import json
 import warnings
+import re
 
 
 # wrapper to read and handle clfp ECOG data
@@ -20,7 +21,11 @@ def load_ecog_clfp_data(data_file_name,t_range=(0,-1),exp_file_name=None,mask_fi
     # get file path, set ancillary data file names
     data_file = os.path.basename(data_file_name)
     data_file_kern = os.path.splitext(data_file)[0]
-    rec_id, microdrive_name, rec_type = data_file_kern.split('.')
+    data_file_parts = data_file_kern.split('.')
+    if len(data_file_parts) == 3:
+        rec_id, microdrive_name, rec_type = data_file_parts
+    else:
+        rec_id, microdrive_name, _, rec_type = data_file_parts
     data_path = os.path.dirname(data_file_name)
     if exp_file_name is None:
         exp_file_name = os.path.join(data_path,rec_id + ".experiment.json")
@@ -37,18 +42,30 @@ def load_ecog_clfp_data(data_file_name,t_range=(0,-1),exp_file_name=None,mask_fi
         with open(exp_file_name,'r') as f:
             experiment = json.load(f)
     else:
-        raise NameError("Experiment file {} either invalid or not found. Aborting Process.".format(exp_file_name))
+        raise NameError(f'Experiment file {exp_file_name} either invalid or not found. Aborting Process.')
 
     # get srate
+    dsmatch = re.search('clfp_ds(\d+)',rec_type)
     if rec_type == 'raw':
         srate = experiment['hardware']['acquisition']['samplingrate']
         data_type = np.ushort
+        reshape_order = 'F'
     elif rec_type == 'lfp':
         srate = 1000
         data_type = np.float32
+        reshape_order = 'F'
     elif rec_type == 'clfp':
         srate = 1000
         data_type = np.float32
+        reshape_order = 'F'
+    elif dsmatch:
+        # downsampled data - get srate from name
+        srate = int(dsmatch.group(1))
+        data_type = np.float32
+        compute_mask = False
+        reshape_order = 'C' # files created with np.tofile which forces C ordering. Sorry!
+    else:
+        raise NameError(f'File type {rec_type}.dat not recognized. Aborting read process.')
 
     # get microdrive parameters
     microdrive_name_list = [md['name'] for md in experiment['hardware']['microdrive']]
@@ -73,7 +90,8 @@ def load_ecog_clfp_data(data_file_name,t_range=(0,-1),exp_file_name=None,mask_fi
     print("Loading data file:")
     # n_offset value is the number of bytes to skip
     # n_read value is the number of items to read (by data type)
-    data = read_from_file(data_file_name,data_type,num_ch,n_read,n_offset)
+    data = read_from_file(data_file_name,data_type,num_ch,n_read,n_offset,
+                          reshape_order=reshape_order)
     if rec_type == 'raw': # correct uint16 encoding errors
         data = np.array(data,dtype=np.float32)
         for ch_idx in range(num_ch):
@@ -110,7 +128,7 @@ def read_from_start(data_file_path,data_type,n_ch,n_read):
     return data
 
 # read some time from a given offset
-def read_from_file(data_file_path,data_type,n_ch,n_read,n_offset):
+def read_from_file(data_file_path,data_type,n_ch,n_read,n_offset,reshape_order='F'):
     data_file = open(data_file_path,"rb")
     if np.version.version >= "1.17": # "offset" field not added until later installations
         data = np.fromfile(data_file,dtype=data_type,count=n_read*n_ch,
@@ -118,7 +136,7 @@ def read_from_file(data_file_path,data_type,n_ch,n_read,n_offset):
     else:
         warnings.warn("'offset' feature not available in numpy <= 1.13 - reading from the top",FutureWarning)
         data = np.fromfile(data_file,dtype=data_type,count=n_read*n_ch)
-    data = np.reshape(data,(n_ch,n_read),order='F')
+    data = np.reshape(data,(n_ch,n_read),order=reshape_order)
     data_file.close()
 
     return data
