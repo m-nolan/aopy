@@ -75,13 +75,13 @@ class DataFile():
     # compute data parameter values and add as object attributes
     def set_data_parameters( self, data_file_path, exp_file_path, mask_file_path ):
         # parse file
-        data_file = os.path.basename(data_file_path)
-        data_file_kern = os.path.splitext(data_file)[0]
+        data_file = path.basename(data_file_path)
+        data_file_kern = path.splitext(data_file)[0]
         rec_id, microdrive_name, rec_type = data_file_kern.split('.')
-        data_path = os.path.dirname(data_file_path)
+        data_path = path.dirname(data_file_path)
         
         # read experiment file
-        exp_file = os.path.join(data_path,rec_id + ".experiment.json")
+        exp_file = path.join(data_path,rec_id + ".experiment.json")
         with open(exp_file,'r') as f:
             exp_dict = json.load(f)
         
@@ -104,7 +104,7 @@ class DataFile():
             data_type = np.float32
         
         # read mask
-        ecog_mask_file = os.path.join(data_path,data_file_kern + ".mask.pkl")
+        ecog_mask_file = path.join(data_path,data_file_kern + ".mask.pkl")
         with open(ecog_mask_file,"rb") as mask_f:
             mask = pkl.load(mask_f)
         # data_mask = grow_bool_array(mask["hf"] | mask["sat"], growth_size=int(srate*0.5))
@@ -188,8 +188,7 @@ class DatafileDataset(Dataset):
         src = sample[:,:self.src_len]
         trg = sample[:,self.src_len:]
         if self.transform:
-            src = self.transform(src)
-            trg = self.transform(trg)
+            src,trg = self.transform(src,trg)
         return src, trg
 
 
@@ -218,6 +217,8 @@ class DatafileConcatDataset(Dataset):
         for d in self.datasets:
             assert not isinstance(d, IterableDataset), "ConcatDataset does not support IterableDataset"
         self.cumulative_sizes = self.cumsum(self.datasets)
+        srate_set = list(set([ds.datafile.srate for ds in self.datasets]))
+        assert len(srate_set) == 1, 'all datasets must have the same sampling rate'
         # get intersection of channel labels present in each dataset in self.datasets
         file_labels = []
         for d in self.datasets:
@@ -232,7 +233,8 @@ class DatafileConcatDataset(Dataset):
                 dataset_ch_sample_idx_list.append(list(np.array(d.datafile.ch_labels)[~np.array(d.datafile.ch_idx)]).index(ch_i_l))
             ch_sample_idx_list.append(dataset_ch_sample_idx_list)
         self.ch_idx = ch_sample_idx_list
-        self.n_ch = len(ch_label)
+        self.n_ch = len(self.ch_label)
+        self.srate = srate_set[0]
 
     def __len__(self):
         return self.cumulative_sizes[-1]
@@ -250,10 +252,21 @@ class DatafileConcatDataset(Dataset):
         src, trg = self.datasets[dataset_idx].__getitem__(sample_idx)
         src = src[self.ch_idx[dataset_idx],:]
         trg = trg[self.ch_idx[dataset_idx],:]
-        return (src, trg)
+        return src, trg
 
     @property
-    def cummulative_sizes(self):
+    def cummulative_sizes( self ):
         warnings.warn("cummulative_sizes attribute is renamed to "
                       "cumulative_sizes", DeprecationWarning, stacklevel=2)
         return self.cumulative_sizes
+
+def data_transform_normalize( src, trg, scale_factor=1. ):
+    r'''Data transform. Normalizes src, trg pairs through z-scoring.
+    '''
+
+    sample = np.concatenate((src,trg),axis=-1)
+    center = np.mean(sample,axis=-1)
+    std = np.std(sample,axis=-1)
+    src = scale_factor * ((src.T - center)/std).T # is there a better way to align dimensions? einsum?
+    trg = scale_factor * ((trg.T - center)/std).T
+    return (src, trg)
