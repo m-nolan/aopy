@@ -99,9 +99,17 @@ class DataFile():
         elif rec_type == 'lfp':
             srate = 1000
             data_type = np.float32
-        elif rec_type == 'clfp':
-            srate = 1000
+        clfp_pattern = 'clfp*'
+        elif re.match(clfp_pattern,rec_type):
             data_type = np.float32
+            if rec_type == 'clfp':
+                # there are a few different naming conventions, this is the default
+                srate = 1000
+            else:
+                ds_regex = 'clfp_ds(\d+)'
+                ds_match = re.search(ds_regex,rec_type)
+                srate = int(ds_match.group(1))
+        assert isinstance(srate,int), 'parsed srate value not an integer'
         
         # read mask
         ecog_mask_file = path.join(data_path,data_file_kern + ".mask.pkl")
