@@ -71,6 +71,52 @@ class DataFile():
         # consider: time array? May not want to incorporate until global time is added
         return data
 
+    @staticmethod
+    def get_microdrive_parameters(exp_dict):
+        microdrive_name_list = [md['name'] for md in exp_dict['hardware']['microdrive']]
+        microdrive_idx = [md_idx for md_idx, md in enumerate(microdrive_name_list) if microdrive_name == md][0]
+        microdrive_dict = exp_dict['hardware']['microdrive'][microdrive_idx]
+        electrode_label_list = [e['label'] for e in exp_dict['hardware']['microdrive'][0]['electrodes']]
+        n_ch = len(electrode_label_list)
+        return electrode_label_list, n_ch
+
+    @staticmethod
+    def get_srate_and_datatype(exp_dict,rec_type):
+        clfp_pattern = 'clfp*'
+        if rec_type == 'raw':
+            srate = exp_dict['hardware']['acquisition']['samplingrate']
+            data_type = np.ushort
+        elif rec_type == 'lfp':
+            srate = 1000
+            data_type = np.float32
+        elif re.match(clfp_pattern,rec_type):
+            data_type = np.float32
+            if rec_type == 'clfp':
+                # there are a few different naming conventions, this is the default
+                srate = 1000
+            else:
+                clfp_ds_pattern = 'clfp_ds(\d+)'
+                ds_match = re.search(clfp_ds_pattern,rec_type)
+                srate = int(ds_match.group(1))
+        assert isinstance(srate,int), 'parsed srate value not an integer'
+        return srate, data_type
+
+    @staticmethod
+    def get_mask_file_path(data_path,rec_type):
+        clfp_pattern = 'clfp*'
+        if rec_type == 'raw':
+            ecog_mask_file = None
+        elif rec_type == 'lfp':
+            ecog_mask_file = None
+        elif re.match(clfp_pattern,rec_type):
+            if rec_type == 'clfp':
+                ecog_mask_file = path.join(data_path,data_file_kern + ".mask.pkl")
+            else:
+                clfp_ds_pattern = 'clfp_ds(\d+)'
+                ds_match = re.search(clfp_ds_pattern,rec_type) # just the string this time
+                ecog_mask_file = path.join(data_path,ds_match.group()+"mask.pkl")
+        return ecog_mask_file
+                
 
     # compute data parameter values and add as object attributes
     def set_data_parameters( self, data_file_path, exp_file_path, mask_file_path ):
@@ -86,33 +132,13 @@ class DataFile():
             exp_dict = json.load(f)
         
         # get microdrive parameters
-        microdrive_name_list = [md['name'] for md in exp_dict['hardware']['microdrive']]
-        microdrive_idx = [md_idx for md_idx, md in enumerate(microdrive_name_list) if microdrive_name == md][0]
-        microdrive_dict = exp_dict['hardware']['microdrive'][microdrive_idx]
-        electrode_label_list = [e['label'] for e in exp_dict['hardware']['microdrive'][0]['electrodes']]
-        n_ch = len(electrode_label_list)
+        electrode_label_list, n_ch = get_microdrive_parameters(exp_dict)
         
         # get srate
-        if rec_type == 'raw':
-            srate = exp_dict['hardware']['acquisition']['samplingrate']
-            data_type = np.ushort
-        elif rec_type == 'lfp':
-            srate = 1000
-            data_type = np.float32
-        clfp_pattern = 'clfp*'
-        elif re.match(clfp_pattern,rec_type):
-            data_type = np.float32
-            if rec_type == 'clfp':
-                # there are a few different naming conventions, this is the default
-                srate = 1000
-            else:
-                ds_regex = 'clfp_ds(\d+)'
-                ds_match = re.search(ds_regex,rec_type)
-                srate = int(ds_match.group(1))
-        assert isinstance(srate,int), 'parsed srate value not an integer'
+        srate, data_type = get_srate_and_datatype(exp_dict, rec_type)
         
         # read mask
-        ecog_mask_file = path.join(data_path,data_file_kern + ".mask.pkl")
+        ecog_mask_file = get_mask_file_path(data_path,rec_type)
         with open(ecog_mask_file,"rb") as mask_f:
             mask = pkl.load(mask_f)
         # data_mask = grow_bool_array(mask["hf"] | mask["sat"], growth_size=int(srate*0.5))
