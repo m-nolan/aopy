@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, SubsetRandomSampler, RandomSampler, DataLoader
 import numpy as np
 import scipy as sp
 import os.path as path # may need to build a switch here for PC/POSIX
@@ -72,7 +72,7 @@ class DataFile():
         return data
 
     @staticmethod
-    def get_microdrive_parameters(exp_dict):
+    def get_microdrive_parameters(exp_dict,microdrive_name):
         microdrive_name_list = [md['name'] for md in exp_dict['hardware']['microdrive']]
         microdrive_idx = [md_idx for md_idx, md in enumerate(microdrive_name_list) if microdrive_name == md][0]
         microdrive_dict = exp_dict['hardware']['microdrive'][microdrive_idx]
@@ -102,7 +102,7 @@ class DataFile():
         return srate, data_type
 
     @staticmethod
-    def get_mask_file_path(data_path,rec_type):
+    def get_mask_file_path(data_path,rec_type,data_file_kern):
         clfp_pattern = 'clfp*'
         if rec_type == 'raw':
             ecog_mask_file = None
@@ -113,13 +113,14 @@ class DataFile():
                 ecog_mask_file = path.join(data_path,data_file_kern + ".mask.pkl")
             else:
                 clfp_ds_pattern = 'clfp_ds(\d+)'
-                ds_match = re.search(clfp_ds_pattern,rec_type) # just the string this time
-                ecog_mask_file = path.join(data_path,ds_match.group()+"mask.pkl")
+                ds_match = re.search(clfp_ds_pattern,rec_type)
+                clfp_ds_file_kern = ".".join(data_file_kern.split(".")[:-1] + [ds_match.group()])
+                ecog_mask_file = path.join(data_path,clfp_ds_file_kern+".mask.pkl")
         return ecog_mask_file
                 
 
     # compute data parameter values and add as object attributes
-    def set_data_parameters( self, data_file_path, exp_file_path, mask_file_path ):
+    def set_data_parameters( self, data_file_path, exp_file_path, mask_file_path):
         # parse file
         data_file = path.basename(data_file_path)
         data_file_kern = path.splitext(data_file)[0]
@@ -132,13 +133,13 @@ class DataFile():
             exp_dict = json.load(f)
         
         # get microdrive parameters
-        electrode_label_list, n_ch = get_microdrive_parameters(exp_dict)
+        electrode_label_list, n_ch = self.get_microdrive_parameters(exp_dict,microdrive_name)
         
         # get srate
-        srate, data_type = get_srate_and_datatype(exp_dict, rec_type)
+        srate, data_type = self.get_srate_and_datatype(exp_dict, rec_type)
         
         # read mask
-        ecog_mask_file = get_mask_file_path(data_path,rec_type)
+        ecog_mask_file = self.get_mask_file_path(data_path,rec_type,data_file_kern)
         with open(ecog_mask_file,"rb") as mask_f:
             mask = pkl.load(mask_f)
         # data_mask = grow_bool_array(mask["hf"] | mask["sat"], growth_size=int(srate*0.5))
@@ -170,7 +171,6 @@ class DataFile():
         self.n_sample = len(self.data_mask)
         self.t_total = self.n_sample/self.srate # (s)
 
-
 class DatafileDataset(Dataset):
 
     r"""pytorch Dataset accessing Datafile interface.
@@ -187,7 +187,7 @@ class DatafileDataset(Dataset):
 
     """
 
-    def __init__( self, datafile, src_t, trg_t, step_t, transform=None ):
+    def __init__( self, datafile, src_t, trg_t, step_t, transform=None, device='cpu' ):
         assert (isinstance(datafile, DataFile) or path.exists(datafile)), 'first argument must be DataFile object or valid path string'
         if isinstance(datafile, str):
             datafile = DataFile(datafile)
@@ -213,17 +213,18 @@ class DatafileDataset(Dataset):
         self.sample_start_idx = sample_start_idx
         self.sample_start_t = sample_start_t
         self.transform = transform
+        self.device = device
 
     def __len__( self ):
         return len(self.sample_start_idx)
 
     def __getitem__( self, idx, ch_idx=None ):
         sample = self.datafile.read(t_start=self.sample_start_t[idx],t_len=self.sample_t,ch_idx=ch_idx)
-        src = sample[:,:self.src_len]
-        trg = sample[:,self.src_len:]
+        src = torch.tensor(sample[:,:self.src_len]).T
+        trg = torch.tensor(sample[:,self.src_len:]).T
         if self.transform:
-            src,trg = self.transform(src,trg)
-        return src, trg
+            src,trg = self.transform((src,trg))
+        return src.to(self.device), trg.to(self.device)
 
 
 class DatafileConcatDataset(Dataset):
@@ -244,7 +245,7 @@ class DatafileConcatDataset(Dataset):
             s += l
         return r
 
-    def __init__(self, datasets):
+    def __init__(self, datasets, transform=None):
         super(DatafileConcatDataset, self).__init__()
         assert len(datasets) > 0, 'datasets should not be an empty iterable'
         self.datasets = list(datasets)
@@ -269,6 +270,7 @@ class DatafileConcatDataset(Dataset):
         self.ch_idx = ch_sample_idx_list
         self.n_ch = len(self.ch_label)
         self.srate = srate_set[0]
+        self.transform = transform
 
     def __len__(self):
         return self.cumulative_sizes[-1]
@@ -284,9 +286,55 @@ class DatafileConcatDataset(Dataset):
         else:
             sample_idx = idx - self.cumulative_sizes[dataset_idx - 1]
         src, trg = self.datasets[dataset_idx].__getitem__(sample_idx)
-        src = src[self.ch_idx[dataset_idx],:]
-        trg = trg[self.ch_idx[dataset_idx],:]
+        src = src[:,self.ch_idx[dataset_idx]]
+        trg = trg[:,self.ch_idx[dataset_idx]]
+        if self.transform:
+            src, trg = self.transform((src,trg))
         return src, trg
+
+    def get_data_loaders( self, partition=(0.8,0.2,0.0), batch_size=1, rand_part=False, rand_seed=42 ):
+        r'''
+            Return dataloader objects for accessing training, validation and testing 
+            partitions of the DatafileConcatDataset. Dataloaders can sample sequentially or randomly.
+
+            arguments:
+                - partition (default (0.8,0.2,0.0)): tuple of partition fractional sizes (train_frac, valid_frac, test_frac).
+                    Values will be normalized to sum to 1.
+                - batch_size (default 1): int value defining the size of each batch draw
+                - rand_part (default False): bool determining sequential or random partitioning
+                - rand_seed (default 42): int setting the rng. Keeps partitions consistent
+        '''
+        # get partition sizes
+        frac_sum = np.sum(partition)
+        train_frac = partition[0]/frac_sum
+        valid_frac = partition[1]/frac_sum
+        test_frac = partition[2]/frac_sum
+        n_train_samp = round(train_frac * len(self))
+        n_valid_samp = round(valid_frac * len(self))
+        n_test_samp = round(test_frac * len(self))
+        # create partition index arrays
+        if rand_part:
+            if not isinstance(rand_seed, int):
+                try: rand_seed_new = int(rand_seed)
+                except:
+                    raise TypeError(f'Could not cast rand_seed value {rand_seed} to int.')
+                raise Warning(f'ValueWarning: rand_seed must be of type int. Casting from {type(rand_seed)} {rand_seed} to int {rand_seed_new}. This might cause issues.')
+            sample_idx = np.random.RandomState(seed=rand_seed).permutation(len(self))
+        else:
+            sample_idx = np.arange(len(self))
+        train_sample_idx = sample_idx[:n_train_samp]
+        valid_sample_idx = sample_idx[n_train_samp:(n_train_samp+n_valid_samp)]
+        test_sample_idx = sample_idx[(n_train_samp+n_valid_samp):]
+        # create samplers
+        train_sampler = SubsetRandomSampler(train_sample_idx)
+        valid_sampler = SubsetRandomSampler(valid_sample_idx)
+        test_sampler = SubsetRandomSampler(test_sample_idx)
+        # create dataloaders
+        train_loader = DataLoader(self,batch_size=batch_size,sampler=train_sampler)
+        valid_loader = DataLoader(self,batch_size=batch_size,sampler=valid_sampler)
+        test_loader = DataLoader(self,batch_size=batch_size,sampler=test_sampler)
+
+        return train_loader, valid_loader, test_loader
 
     @property
     def cummulative_sizes( self ):
